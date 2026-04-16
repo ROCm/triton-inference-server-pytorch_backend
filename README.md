@@ -26,6 +26,124 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 -->
 
+
+# PyTorch (LibTorch) Backend - ROCm Edition
+
+This is the ROCm-enabled fork of the
+[Triton Inference Server PyTorch Backend](https://github.com/triton-inference-server/pytorch_backend).
+It adds support for AMD GPUs via ROCm/HIP while maintaining full compatibility
+with the upstream feature set.
+
+## ROCm Hipification
+
+The backend's CUDA C++ source code is automatically converted to HIP at build
+time using a two-stage process:
+
+1. **`hipify-perl`** (shipped with ROCm at `/opt/rocm/bin/hipify-perl`) performs
+   the bulk conversion of CUDA runtime/driver API calls to their HIP
+   equivalents (e.g. `cudaStream_t` to `hipStream_t`, `cudaSetDevice` to
+   `hipSetDevice`, `cuda_runtime_api.h` to `hip/hip_runtime_api.h`).
+
+2. **`amd_hipify.py`** applies project-specific post-processing:
+   - Switches preprocessor guards from `TRITON_ENABLE_GPU` to
+     `TRITON_ENABLE_ROCM`.
+   - Renames Triton backend utilities to match the hipified backend library
+     (`CudaStream` to `RocmStream`, etc.).
+   - Redirects PyTorch include paths from `c10/cuda/` to `c10/hip/` so the
+     build does not depend on CUDA compatibility headers.
+   - Preserves PyTorch's `c10::cuda` / `at::cuda` C++ namespaces, which
+     remain unchanged even in ROCm-built PyTorch.
+
+The CMake module `triton_rocm_hipify.cmake` orchestrates this process,
+generating hipified source files under `build/amdgpu/` which are then compiled
+in place of the original CUDA sources.
+
+## Building for ROCm (Standalone)
+
+> **Note:** A standalone build of the PyTorch backend is typically not necessary.
+> In most cases, the
+> [Triton Server build system](https://github.com/ROCm/triton-inference-server-server)
+> will build all backends (including PyTorch) into the final server artifacts.
+> The standalone build instructions below are provided for development and
+> testing purposes only.
+
+### Prerequisites
+
+- AMD GPU with ROCm support (e.g. MI210, MI250, MI300X, MI355X)
+- ROCm 7.2 installed (`/opt/rocm`)
+- Docker (recommended)
+
+### Step 1: Start a ROCm container
+
+Use an Ubuntu-based container with ROCm installed:
+
+```bash
+docker run \
+  --name pytorch_container \
+  --device=/dev/kfd \
+  --device=/dev/dri \
+  --ipc=host \
+  -it \
+  --net=host \
+  rocm/dev-ubuntu-24.04:7.2.2-complete \
+  /bin/bash
+```
+
+### Step 2: Install dependencies
+
+```bash
+apt-get update && apt-get install -y \
+  git cmake rapidjson-dev python3-dev python3-pip patchelf libboost-dev libre2-dev
+
+pip3 install --break-system-packages \
+  torch torchvision --index-url https://download.pytorch.org/whl/rocm7.2
+```
+
+### Step 3: Configure and build
+
+```bash
+mkdir /workspace && cd /workspace && git clone https://github.com/ROCm/triton-inference-server-pytorch_backend.git
+cd /workspace/triton-inference-server-pytorch_backend
+mkdir -p build && cd build
+
+cmake .. \
+  -DCMAKE_INSTALL_PREFIX:PATH=$(pwd)/install \
+  -DTRITON_ENABLE_GPU=OFF \
+  -DTRITON_ENABLE_ROCM=ON \
+  -DTRITON_ROCM_HOME=/opt/rocm \
+  -DTRITON_HIPIFY_PERL=/opt/rocm/bin/hipify-perl \
+  -DCMAKE_PREFIX_PATH="$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)');/opt/rocm" \
+  -DCMAKE_CXX_COMPILER=/opt/rocm/bin/amdclang++ \
+  -DTRITON_PYTORCH_ENABLE_TORCHVISION=OFF \
+  -DTRITON_PYTORCH_NVSHMEM=OFF \
+  -DTRITON_BACKEND_REPO_TAG=r25.12 \
+  -DTRITON_CORE_REPO_TAG=r25.12 \
+  -DTRITON_COMMON_REPO_TAG=r25.12
+
+make -j$(nproc) install
+```
+
+The built backend will be located at `build/install/backends/pytorch/`.
+
+### CMake Options for ROCm
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `TRITON_ENABLE_ROCM` | `ON` | Enable ROCm/HIP support (mutually exclusive with `TRITON_ENABLE_GPU`) |
+| `TRITON_ROCM_HOME` | `/opt/rocm` | ROCm installation path |
+| `TRITON_HIPIFY_PERL` | *(empty)* | Path to `hipify-perl` executable |
+| `TRITON_ROCM_REPO_ORGANIZATION` | `https://github.com/ROCm` | Git organization for ROCm forks of core/backend |
+| `TRITON_ROCM_REPO_TAG` | `rocm7.2_r25.12` | Git tag for ROCm fork repos |
+
+---
+
+> The sections below are from the upstream
+> [triton-inference-server/pytorch_backend](https://github.com/triton-inference-server/pytorch_backend)
+> repository and describe the NVIDIA/CUDA build and general usage of the
+> PyTorch backend. They apply equally to the ROCm edition unless noted otherwise.
+
+---
+
 # PyTorch (LibTorch) Backend
 
 [![License](https://img.shields.io/badge/License-BSD3-lightgrey.svg)](https://opensource.org/licenses/BSD-3-Clause)
