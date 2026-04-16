@@ -63,7 +63,7 @@ in place of the original CUDA sources.
 > **Note:** A standalone build of the PyTorch backend is typically not necessary.
 > In most cases, the
 > [Triton Server build system](https://github.com/ROCm/triton-inference-server-server)
-> will build all backends (including PyTorch) into the final server artifacts.
+> will build backends (including PyTorch) into the final server artifacts.
 > The standalone build instructions below are provided for development and
 > testing purposes only.
 
