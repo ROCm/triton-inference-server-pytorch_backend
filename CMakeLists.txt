@@ -45,7 +45,8 @@ set(TRITON_MIN_CXX_STANDARD 17 CACHE STRING "The minimum C++ standard which feat
 #     PyTorch to base the build off.
 #
 
-option(TRITON_ENABLE_GPU "Enable GPU support in backend" ON)
+option(TRITON_ENABLE_GPU "Enable GPU support in backend" OFF)
+option(TRITON_ENABLE_ROCM "Enable ROCm/HIP support in backend" ON)
 option(TRITON_ENABLE_STATS "Include statistics collections in backend" ON)
 option(TRITON_ENABLE_NVTX "Include nvtx markers collection in backend." OFF)
 option(TRITON_PYTORCH_ENABLE_TORCHTRT "Enable TorchTRT support" OFF)
@@ -55,6 +56,10 @@ option(TRITON_PYTORCH_NVSHMEM "Enable NVSHMEM support" ON)
 set(TRITON_PYTORCH_DOCKER_IMAGE "" CACHE STRING "Docker image containing the PyTorch build required by backend.")
 set(TRITON_PYTORCH_INCLUDE_PATHS "" CACHE PATH "Paths to Torch includes")
 set(TRITON_PYTORCH_LIB_PATHS "" CACHE PATH "Paths to Torch libraries")
+set(TRITON_HIPIFY_PERL "" CACHE STRING "Path to hipify-perl executable")
+set(TRITON_ROCM_HOME "/opt/rocm" CACHE PATH "ROCm installation path")
+set(TRITON_ROCM_REPO_ORGANIZATION "https://github.com/ROCm" CACHE STRING "Git repository for ROCm forks")
+set(TRITON_ROCM_REPO_TAG "rocm7.2_r25.12" CACHE STRING "Tag for ROCm fork repos (core, backend)")
 
 set(TRITON_REPO_ORGANIZATION "https://github.com/triton-inference-server" CACHE STRING "Git repository to pull from")
 set(TRITON_BACKEND_REPO_TAG "main" CACHE STRING "Tag for triton-inference-server/backend repo")
@@ -65,8 +70,19 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+if(${TRITON_ENABLE_ROCM} AND ${TRITON_ENABLE_GPU})
+  message(FATAL_ERROR "TRITON_ENABLE_ROCM and TRITON_ENABLE_GPU cannot both be ON")
+endif()
+
 set(TRITON_PYTORCH_DOCKER_BUILD OFF)
-if(TRITON_PYTORCH_LIB_PATHS STREQUAL "")
+
+if(${TRITON_ENABLE_ROCM})
+  # ROCm: find Torch from the container/system install instead of Docker extraction.
+  find_package(Torch REQUIRED)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
+  set(TRITON_PYTORCH_LIB_PATHS "${TORCH_INSTALL_PREFIX}/lib")
+  set(TRITON_PYTORCH_INCLUDE_PATHS "${TORCH_INCLUDE_DIRS}")
+elseif(TRITON_PYTORCH_LIB_PATHS STREQUAL "")
   if(TRITON_PYTORCH_DOCKER_IMAGE STREQUAL "")
     message(FATAL_ERROR "Using the PyTorch docker based build requires TRITON_PYTORCH_DOCKER_IMAGE")
   endif()
@@ -139,30 +155,58 @@ FetchContent_Declare(
   GIT_TAG ${TRITON_COMMON_REPO_TAG}
   GIT_SHALLOW ON
 )
-FetchContent_Declare(
-  repo-core
-  GIT_REPOSITORY ${TRITON_REPO_ORGANIZATION}/core.git
-  GIT_TAG ${TRITON_CORE_REPO_TAG}
-  GIT_SHALLOW ON
-)
-FetchContent_Declare(
-  repo-backend
-  GIT_REPOSITORY ${TRITON_REPO_ORGANIZATION}/backend.git
-  GIT_TAG ${TRITON_BACKEND_REPO_TAG}
-  GIT_SHALLOW ON
-)
+if(${TRITON_ENABLE_ROCM})
+  FetchContent_Declare(
+    repo-core
+    GIT_REPOSITORY ${TRITON_ROCM_REPO_ORGANIZATION}/triton-inference-server-core.git
+    GIT_TAG ${TRITON_ROCM_REPO_TAG}
+    GIT_SHALLOW ON
+  )
+  FetchContent_Declare(
+    repo-backend
+    GIT_REPOSITORY ${TRITON_ROCM_REPO_ORGANIZATION}/triton-inference-server-backend.git
+    GIT_TAG ${TRITON_ROCM_REPO_TAG}
+    GIT_SHALLOW ON
+  )
+else()
+  FetchContent_Declare(
+    repo-core
+    GIT_REPOSITORY ${TRITON_REPO_ORGANIZATION}/core.git
+    GIT_TAG ${TRITON_CORE_REPO_TAG}
+    GIT_SHALLOW ON
+  )
+  FetchContent_Declare(
+    repo-backend
+    GIT_REPOSITORY ${TRITON_REPO_ORGANIZATION}/backend.git
+    GIT_TAG ${TRITON_BACKEND_REPO_TAG}
+    GIT_SHALLOW ON
+  )
+endif()
 FetchContent_MakeAvailable(repo-common repo-core repo-backend)
 
 #
-# CUDA
+# CUDA / ROCm
 #
-if(${TRITON_ENABLE_GPU})
+if(${TRITON_ENABLE_ROCM})
+  list(APPEND CMAKE_PREFIX_PATH ${TRITON_ROCM_HOME})
+  find_package(hip REQUIRED CONFIG PATHS ${HIP_DIR} ${ROCM_PATH} ${TRITON_ROCM_HOME})
+
+  if(NOT TRITON_HIPIFY_PERL)
+    find_path(HIPIFY_PERL_PATH
+      NAMES hipify-perl
+      HINTS ${TRITON_ROCM_HOME}/bin ${TRITON_ROCM_HOME}/hip/bin)
+    if(HIPIFY_PERL_PATH-NOTFOUND)
+      message(FATAL_ERROR "hipify-perl not found")
+    endif()
+    set(TRITON_HIPIFY_PERL ${HIPIFY_PERL_PATH}/hipify-perl)
+  endif()
+elseif(${TRITON_ENABLE_GPU})
   find_package(CUDAToolkit REQUIRED)
 else()
   if (${TRITON_PYTORCH_ENABLE_TORCHTRT})
     message(FATAL_ERROR "TRITON_PYTORCH_ENABLE_TORCHTRT is ON when TRITON_ENABLE_GPU is OFF")
   endif()
-endif() # TRITON_ENABLE_GPU
+endif() # TRITON_ENABLE_GPU / TRITON_ENABLE_ROCM
 
 if(${TRITON_ENABLE_NVTX})
   add_definitions(-DTRITON_ENABLE_NVTX=1)
@@ -173,28 +217,41 @@ endif() # TRITON_ENABLE_NVTX
 #
 configure_file(src/libtriton_pytorch.ldscript libtriton_pytorch.ldscript COPYONLY)
 
-set(PT_LIBS
-    "libc10.so"
-    "libc10_cuda.so"
-    "libtorch.so"
-    "libtorch_cpu.so"
-    "libtorch_cuda.so"
-    "libtorch_cuda_linalg.so"
-    "libtorch_global_deps.so"
-    "libjpeg.so.62"
-    "libshm.so"
-    "libbackend_with_compiler.so"
-    "libaoti_custom_ops.so"
-    "libtorch_python.so"
-    "libcaffe2_nvrtc.so"
-)
-
-if (${TRITON_PYTORCH_NVSHMEM})
+if(${TRITON_ENABLE_ROCM})
   set(PT_LIBS
-      ${PT_LIBS}
-      "libtorch_nvshmem.so"
+      "libc10.so"
+      "libc10_hip.so"
+      "libtorch.so"
+      "libtorch_cpu.so"
+      "libtorch_hip.so"
+      "libtorch_global_deps.so"
+      "libshm.so"
+      "libtorch_python.so"
   )
-endif() # TRITON_PYTORCH_NVSHMEM
+else()
+  set(PT_LIBS
+      "libc10.so"
+      "libc10_cuda.so"
+      "libtorch.so"
+      "libtorch_cpu.so"
+      "libtorch_cuda.so"
+      "libtorch_cuda_linalg.so"
+      "libtorch_global_deps.so"
+      "libjpeg.so.62"
+      "libshm.so"
+      "libbackend_with_compiler.so"
+      "libaoti_custom_ops.so"
+      "libtorch_python.so"
+      "libcaffe2_nvrtc.so"
+  )
+
+  if (${TRITON_PYTORCH_NVSHMEM})
+    set(PT_LIBS
+        ${PT_LIBS}
+        "libtorch_nvshmem.so"
+    )
+  endif() # TRITON_PYTORCH_NVSHMEM
+endif() # TRITON_ENABLE_ROCM
 
 if (${TRITON_PYTORCH_ENABLE_TORCHVISION})
   set(PT_LIBS
@@ -319,41 +376,66 @@ if (${TRITON_PYTORCH_DOCKER_BUILD})
   )
 endif() # TRITON_PYTORCH_DOCKER_BUILD
 
+#
+# Source files — use hipified copies when building for ROCm.
+#
+if(${TRITON_ENABLE_ROCM})
+  set(REPO_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
+  include(${CMAKE_CURRENT_SOURCE_DIR}/triton_rocm_hipify.cmake)
+  set(hipify_excluded "")
+  hipify("src" hipify_excluded HIPIFIED_CC_FILES HIPIFIED_CU_FILES)
+  set(BACKEND_SRCS ${HIPIFIED_CC_FILES})
+else()
+  set(BACKEND_SRCS
+    src/libtorch.cc
+    src/libtorch_utils.cc
+    src/libtorch_utils.h
+    src/model_instance_state.cc
+    src/model_state.cc
+    src/string_utils.cc
+  )
+endif()
+
 add_library(
   triton-pytorch-backend SHARED
-  src/libtorch.cc
-  src/libtorch_utils.cc
-  src/libtorch_utils.h
-  src/model_instance_state.cc
-  src/model_state.cc
-  src/string_utils.cc
+  ${BACKEND_SRCS}
 )
 
 add_library(
   TritonPyTorchBackend::triton-pytorch-backend ALIAS triton-pytorch-backend
 )
 
-target_include_directories(
-  triton-pytorch-backend
-  PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${Python3_INCLUDE_DIRS}
-)
-
-if (${TRITON_PYTORCH_DOCKER_BUILD})
+if(${TRITON_ENABLE_ROCM})
   target_include_directories(
     triton-pytorch-backend
     PRIVATE
-      ${CMAKE_CURRENT_BINARY_DIR}/include/torch
-      ${CMAKE_CURRENT_BINARY_DIR}/include/torch/torch/csrc/api/include
-      ${CMAKE_CURRENT_BINARY_DIR}/include/torchvision
+      ${CMAKE_CURRENT_BINARY_DIR}/amdgpu/src
+      ${TORCH_INCLUDE_DIRS}
+      ${Python3_INCLUDE_DIRS}
   )
 else()
   target_include_directories(
     triton-pytorch-backend
-    PRIVATE ${TRITON_PYTORCH_INCLUDE_PATHS}
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src
+      ${Python3_INCLUDE_DIRS}
   )
-endif() # TRITON_PYTORCH_DOCKER_BUILD
+
+  if (${TRITON_PYTORCH_DOCKER_BUILD})
+    target_include_directories(
+      triton-pytorch-backend
+      PRIVATE
+        ${CMAKE_CURRENT_BINARY_DIR}/include/torch
+        ${CMAKE_CURRENT_BINARY_DIR}/include/torch/torch/csrc/api/include
+        ${CMAKE_CURRENT_BINARY_DIR}/include/torchvision
+    )
+  else()
+    target_include_directories(
+      triton-pytorch-backend
+      PRIVATE ${TRITON_PYTORCH_INCLUDE_PATHS}
+    )
+  endif() # TRITON_PYTORCH_DOCKER_BUILD
+endif() # TRITON_ENABLE_ROCM
 
 # Need to turn off -Werror due to Torchvision vision.h extern initialization
 # Unfortunately gcc does not provide a specific flag to ignore the specific
@@ -365,12 +447,17 @@ target_compile_options(
     -Wall -Wextra -Wno-unused-parameter -Wno-type-limits>
 )
 
-if(${TRITON_ENABLE_GPU})
+if(${TRITON_ENABLE_ROCM})
+  target_compile_definitions(
+    triton-pytorch-backend
+    PRIVATE TRITON_ENABLE_ROCM=1
+  )
+elseif(${TRITON_ENABLE_GPU})
   target_compile_definitions(
     triton-pytorch-backend
     PRIVATE TRITON_ENABLE_GPU=1
   )
-endif() # TRITON_ENABLE_GPU
+endif() # TRITON_ENABLE_GPU / TRITON_ENABLE_ROCM
 
 set_target_properties(
   triton-pytorch-backend
@@ -454,13 +541,19 @@ target_link_libraries(
     ${TRITON_PYTORCH_LIBS}
 )
 
-if(${TRITON_ENABLE_GPU})
+if(${TRITON_ENABLE_ROCM})
+  target_link_libraries(
+    triton-pytorch-backend
+    PRIVATE
+      hip::host
+  )
+elseif(${TRITON_ENABLE_GPU})
   target_link_libraries(
     triton-pytorch-backend
     PRIVATE
       CUDA::cudart
   )
-endif() # TRITON_ENABLE_GPU
+endif() # TRITON_ENABLE_GPU / TRITON_ENABLE_ROCM
 
 #
 # Install
